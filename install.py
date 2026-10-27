@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Ubuntu bootstrap for the private TEST release; never logs credentials."""
+"""Standalone private-access launcher; also supports curl | sudo python3 -."""
 import argparse
+import base64
 import getpass
 import hashlib
 import ipaddress
@@ -9,267 +10,216 @@ import os
 from pathlib import Path
 import platform
 import re
-import shutil
 import stat
 import subprocess
 import sys
 import tempfile
 import warnings
-from urllib.parse import urlsplit
-from urllib.request import Request, HTTPRedirectHandler, build_opener
+from urllib.parse import urlencode, urlsplit
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
-RELEASE_API = 'https://api.github.com/repos/duarteprg-eng/notarialease/releases/tags/docker-v1.0.27-test.1'
-DOCKER_KEY_URL = 'https://download.docker.com/linux/ubuntu/gpg'
-DOCKER_KEY_FINGERPRINT = '9DC858229FC7DD38854AE2D88D81803C0EBFCD88'
-PHASE = 'preflight'
+BOOTSTRAP_URL = 'https://raw.githubusercontent.com/duarteprg-eng/notarialease-installer/docker-v1.0.27-test.1/install.py'
+BOOTSTRAP_SHA = '426759680a12e3db2f99f1b2353df8f55a7303ac1b340d1e8f025c8b287ecaf1'
+RELEASE_ID = 426033992
+TAG = 'docker-v1.0.27-test.1'
+API = 'https://api.github.com/repos/duarteprg-eng/notarialease'
+IMAGE_DIGEST = 'sha256:12939521a2eae6975adf61c8a2616697fa8d0bd1ed28b1067274cb14f6b5771d'
+IMAGE = 'ghcr.io/duarteprg-eng/notarialease@' + IMAGE_DIGEST
+CONFIG = '/root/.config/notarialease-install'
+NAMES = ('github-release.token', 'ghcr-read.token')
+TOKEN_PATTERN = r'[A-Za-z0-9._~+/-]+=*'
 
 class Failure(Exception):
     pass
 
 def require(ok, code):
-    if not ok:
-        raise Failure(code)
+    if not ok: raise Failure(code)
 
-def safe_url(value):
-    u = urlsplit(value)
-    require(u.scheme == 'https' and u.hostname and not u.username and not u.password
-            and not u.query and not u.fragment and u.port in (None, 443)
-            and all(32 < ord(c) < 127 for c in value), 'HTTPS_URL_INVALID')
-    return u
+def directory_guard(directory, allow_missing=False):
+    require(directory.is_absolute(), 'CREDENTIAL_DIRECTORY_INVALID')
+    for current in (directory, *directory.parents):
+        try: info = current.lstat()
+        except FileNotFoundError:
+            require(allow_missing, 'CREDENTIAL_DIRECTORY_MISSING'); continue
+        require(stat.S_ISDIR(info.st_mode) and info.st_uid == 0, 'CREDENTIAL_DIRECTORY_NOT_PRIVATE')
+        require(not info.st_mode & 0o022 or (current != directory and info.st_mode & stat.S_ISVTX),
+                'CREDENTIAL_DIRECTORY_WRITABLE')
+
+def token_format(value):
+    require(isinstance(value, str) and 0 < len(value) <= 8192
+            and re.fullmatch(TOKEN_PATTERN, value) is not None, 'CREDENTIAL_FORMAT_INVALID')
+    return value
+
+def read_private(path):
+    before = path.lstat()
+    require(stat.S_ISREG(before.st_mode) and before.st_uid == 0
+            and stat.S_IMODE(before.st_mode) in (0o400, 0o600)
+            and 0 < before.st_size <= 8192, 'CREDENTIAL_FILE_NOT_PRIVATE')
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        opened = os.fstat(fd)
+        require((opened.st_dev, opened.st_ino) == (before.st_dev, before.st_ino), 'CREDENTIAL_FILE_CHANGED')
+        body = os.read(fd, 8193)
+    finally: os.close(fd)
+    return token_format(body.decode('ascii').rstrip('\r\n'))
+
+def protected_prompt(prompt):
+    try:
+        fd = os.open('/dev/tty', os.O_RDWR | os.O_NOCTTY)
+        try: require(os.isatty(fd), 'PROTECTED_TTY_REQUIRED')
+        finally: os.close(fd)
+    except OSError: raise Failure('PROTECTED_TTY_REQUIRED') from None
+    with warnings.catch_warnings():
+        warnings.simplefilter('error', getpass.GetPassWarning)
+        return token_format(getpass.getpass(prompt))
+
+def credentials(directory):
+    directory_guard(directory, allow_missing=True)
+    paths = tuple(directory / name for name in NAMES)
+    exists = tuple(os.path.lexists(path) for path in paths)
+    require(exists[0] == exists[1], 'CREDENTIAL_PAIR_INCOMPLETE')
+    if all(exists):
+        directory_guard(directory)
+        return paths, tuple(read_private(path) for path in paths), False
+    values = (protected_prompt('Token GitHub Contents read: '),
+              protected_prompt('Token GHCR read:packages: '))
+    return paths, values, True
+
+def save_new_pair(directory, paths, values):
+    # Called only after both credentials passed the remote GET-only checks.
+    import fcntl
+    directory_guard(directory, allow_missing=True)
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    directory_guard(directory)
+    created = []
+    lock = os.open(directory / '.credentials.lock', os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        info = os.fstat(lock)
+        require(stat.S_ISREG(info.st_mode) and info.st_uid == 0 and stat.S_IMODE(info.st_mode) == 0o600,
+                'CREDENTIAL_LOCK_NOT_PRIVATE')
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        require(not any(os.path.lexists(path) for path in paths), 'CREDENTIAL_CREATION_CONFLICT')
+        for path, value in zip(paths, values):
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            info = os.fstat(fd); created.append((path, info.st_dev, info.st_ino))
+            with os.fdopen(fd, 'wb') as stream:
+                stream.write(value.encode('ascii')); stream.flush(); os.fsync(stream.fileno())
+    except BaseException:
+        for path, device, inode in created:
+            try:
+                current = path.lstat()
+                if (current.st_dev, current.st_ino) == (device, inode): path.unlink()
+            except OSError: pass
+        raise
+    finally: os.close(lock)
 
 class SafeRedirect(HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
+    def __init__(self, hosts): self.hosts = hosts
+    def redirect_request(self, request, fp, code, message, headers, newurl):
         target = urlsplit(newurl)
-        require(target.scheme == 'https' and not target.username and not target.password,
-                'HTTPS_REDIRECT_INVALID')
-        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
-        if redirected is not None and urlsplit(req.full_url).netloc.lower() != target.netloc.lower():
+        require(target.scheme == 'https' and target.hostname in self.hosts
+                and not target.username and not target.password, 'ACCESS_REDIRECT_REJECTED')
+        redirected = super().redirect_request(request, fp, code, message, headers, newurl)
+        if redirected and urlsplit(request.full_url).netloc.lower() != target.netloc.lower():
             redirected.remove_header('Authorization')
         return redirected
 
-def download(url, token='', json_api=False):
-    u = safe_url(url)
-    headers = {'User-Agent': 'NotarialEase-Test-Installer',
-               'Accept': 'application/vnd.github+json' if json_api else 'application/octet-stream'}
-    if token and u.hostname == 'api.github.com':
-        headers['Authorization'] = 'Bearer ' + token
-    with build_opener(SafeRedirect()).open(Request(url, headers=headers), timeout=90) as response:
-        body = response.read(8 * 1024 * 1024 + 1)
-    require(len(body) <= 8 * 1024 * 1024, 'ARTIFACT_TOO_LARGE')
-    return body
+def http_get(url, headers=None, hosts=()):
+    target = urlsplit(url)
+    require(target.scheme == 'https' and target.hostname in hosts and target.port in (None, 443)
+            and not target.username and not target.password, 'ACCESS_URL_REJECTED')
+    request = Request(url, headers={'User-Agent': 'NotarialEase-Curl-Installer', **(headers or {})})
+    try:
+        with build_opener(ProxyHandler({}), SafeRedirect(hosts)).open(request, timeout=60) as response:
+            require(response.status == 200, 'ACCESS_HTTP_STATUS_INVALID')
+            body = response.read(8 * 1024 * 1024 + 1)
+            require(len(body) <= 8 * 1024 * 1024, 'ACCESS_RESPONSE_TOO_LARGE')
+            return response.headers, body
+    except Failure: raise
+    except Exception: raise Failure('ACCESS_REQUEST_FAILED') from None
 
-def read_token(filename, variable, prompt):
-    if filename:
-        p = Path(filename)
-        mode = p.lstat()
-        require(stat.S_ISREG(mode.st_mode) and not p.is_symlink() and mode.st_uid == 0
-                and mode.st_mode & 0o077 == 0 and mode.st_size <= 8192, 'TOKEN_FILE_NOT_PRIVATE')
-        token = p.read_text().strip()
-    else:
-        token = os.environ.get(variable, '')
-        if not token:
-            available = sys.stdin.isatty()
-            if not available:
-                try:
-                    fd = os.open('/dev/tty', os.O_RDWR | os.O_NOCTTY)
-                    try: available = os.isatty(fd)
-                    finally: os.close(fd)
-                except OSError:
-                    pass
-            require(available, 'TOKEN_REQUIRED_NO_PROTECTED_TTY')
-            with warnings.catch_warnings():
-                warnings.simplefilter('error', getpass.GetPassWarning)
-                token = getpass.getpass(prompt)
-    require(bool(token) and len(token) <= 8192 and not any(c in token for c in '\r\n\0'), 'TOKEN_INVALID')
-    return token
+def check_access(values, registry_user):
+    github, registry = values
+    auth = {'Authorization': 'Bearer ' + github, 'Accept': 'application/vnd.github+json'}
+    _, body = http_get(API + '/releases/' + str(RELEASE_ID), auth, ('api.github.com',))
+    release = json.loads(body)
+    require(release.get('id') == RELEASE_ID and release.get('tag_name') == TAG
+            and release.get('draft') is False, 'CERTIFIED_RELEASE_MISMATCH')
+    assets = [a for a in release.get('assets', []) if a.get('name') == 'notarialease-release.json']
+    require(len(assets) == 1, 'CERTIFIED_METADATA_NOT_UNIQUE')
+    url = assets[0]['url']
+    require(re.fullmatch(re.escape(API) + r'/releases/assets/[0-9]+', url) is not None,
+            'CERTIFIED_METADATA_URL_INVALID')
+    _, body = http_get(url, {'Authorization': 'Bearer ' + github, 'Accept': 'application/octet-stream'},
+                       ('api.github.com', 'release-assets.githubusercontent.com', 'objects.githubusercontent.com'))
+    metadata = json.loads(body)
+    require(metadata.get('schema') == 1 and metadata.get('release_id') == TAG
+            and metadata.get('app_image') == IMAGE and metadata.get('python_sha256') == BOOTSTRAP_SHA,
+            'CERTIFIED_IMAGE_METADATA_MISMATCH')
+    headers, body = http_get('https://api.github.com/user', {'Authorization': 'Bearer ' + registry}, ('api.github.com',))
+    scopes = {s.strip() for s in headers.get('X-OAuth-Scopes', '').split(',') if s.strip()}
+    require(scopes == {'read:packages'}, 'REGISTRY_SCOPE_NOT_READ_ONLY')
+    require(json.loads(body).get('login', '').lower() == registry_user.lower(), 'REGISTRY_ACCOUNT_MISMATCH')
+    basic = base64.b64encode((registry_user + ':' + registry).encode('ascii')).decode('ascii')
+    url = 'https://ghcr.io/token?' + urlencode({'service': 'ghcr.io', 'scope': 'repository:duarteprg-eng/notarialease:pull'})
+    _, body = http_get(url, {'Authorization': 'Basic ' + basic}, ('ghcr.io',))
+    payload = json.loads(body); bearer = payload.get('token') or payload.get('access_token')
+    token_format(bearer)
+    accept = ', '.join(('application/vnd.oci.image.index.v1+json', 'application/vnd.oci.image.manifest.v1+json',
+                        'application/vnd.docker.distribution.manifest.v2+json', 'application/vnd.docker.distribution.manifest.list.v2+json'))
+    url = 'https://ghcr.io/v2/duarteprg-eng/notarialease/manifests/' + IMAGE_DIGEST
+    headers, body = http_get(url, {'Authorization': 'Bearer ' + bearer, 'Accept': accept}, ('ghcr.io',))
+    require(headers.get('Docker-Content-Digest') == IMAGE_DIGEST
+            and 'sha256:' + hashlib.sha256(body).hexdigest() == IMAGE_DIGEST, 'REGISTRY_MANIFEST_DIGEST_MISMATCH')
 
-def execute(args, env, *, data=None, check=True):
-    result = subprocess.run(args, input=data, capture_output=True, text=True, env=env, timeout=600)
-    if check:
-        require(result.returncode == 0, 'COMMAND_FAILED_' + Path(args[0]).name.upper().replace('-', '_'))
-    return result
-
-def ubuntu_codename():
-    require(platform.system() == 'Linux' and platform.machine() in ('x86_64', 'amd64')
-            and os.geteuid() == 0, 'UBUNTU_AMD64_ROOT_REQUIRED')
-    values = {}
-    for line in Path('/etc/os-release').read_text().splitlines():
-        if '=' in line:
-            key, value = line.split('=', 1)
-            values[key] = value.strip('"\'')
-    require(values.get('ID') == 'ubuntu', 'UBUNTU_REQUIRED')
-    codename = values.get('UBUNTU_CODENAME') or values.get('VERSION_CODENAME', '')
-    require(bool(re.fullmatch('[a-z]+', codename)), 'UBUNTU_CODENAME_INVALID')
-    return codename
-
-def installed(package, env):
-    result = execute(['dpkg-query', '-W', '-f=${db:Status-Status}', package], env, check=False)
-    return result.returncode == 0 and result.stdout.strip() == 'installed'
-
-def apt_install(packages, env):
-    execute(['apt-get', 'install', '-y', '--no-remove', '--no-upgrade', '--no-install-recommends', *packages], env)
-
-def ensure_runtime_tools(env):
-    tools = {'curl': 'curl', 'openssl': 'openssl', 'flock': 'util-linux', 'ss': 'iproute2',
-             'realpath': 'coreutils', 'sha256sum': 'coreutils', 'install': 'coreutils', 'bash': 'bash'}
-    missing = sorted({package for tool, package in tools.items() if shutil.which(tool) is None})
-    if missing:
-        execute(['apt-get', 'update'], env)
-        apt_install(missing, env)
-
-def configure_official_repo(codename, env):
-    source = Path('/etc/apt/sources.list.d/notarialease-docker.sources')
-    key = Path('/etc/apt/keyrings/notarialease-docker.asc')
-    text = ('Types: deb\nURIs: https://download.docker.com/linux/ubuntu\nSuites: ' + codename
-            + '\nComponents: stable\nArchitectures: amd64\nSigned-By: ' + str(key) + '\n')
-    files = [Path('/etc/apt/sources.list'), *Path('/etc/apt/sources.list.d').glob('*.list'),
-             *Path('/etc/apt/sources.list.d').glob('*.sources')]
-    for p in files:
-        if p.exists() and 'download.docker.com/linux/ubuntu' in p.read_text():
-            require(p == source and p.read_text() == text, 'EXISTING_DOCKER_REPOSITORY_REQUIRES_REVIEW')
-    execute(['apt-get', 'update'], env)
-    apt_install(['ca-certificates', 'gnupg'], env)
-    with tempfile.TemporaryDirectory(prefix='nexo-docker-key-') as temporary:
-        directory = Path(temporary)
-        directory.chmod(0o700)
-        candidate = directory / 'docker.asc'
-        candidate.write_bytes(download(DOCKER_KEY_URL))
-        gnupg = directory / 'gnupg'
-        gnupg.mkdir(mode=0o700)
-        result = execute(['gpg', '--homedir', str(gnupg), '--batch', '--with-colons',
-                          '--import-options', 'show-only', '--import', str(candidate)], env)
-        fingerprints = [line.split(':')[9] for line in result.stdout.splitlines() if line.startswith('fpr:')]
-        require(bool(fingerprints) and fingerprints[0] == DOCKER_KEY_FINGERPRINT, 'DOCKER_GPG_FINGERPRINT_INVALID')
-        require(not source.is_symlink() and not key.is_symlink(), 'APT_PATH_SYMLINK')
-        if source.exists():
-            require(source.read_text() == text, 'DOCKER_APT_SOURCE_CONFLICT')
-        key.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
-        key.write_bytes(candidate.read_bytes()); key.chmod(0o644)
-        source.write_text(text); source.chmod(0o644)
-    execute(['apt-get', 'update'], env)
-
-def ensure_docker(codename, env):
-    exists = shutil.which('docker') is not None
-    compose = exists and execute(['docker', 'compose', 'version'], env, check=False).returncode == 0
-    if not exists:
-        conflicts = ['docker.io', 'docker-compose', 'docker-compose-v2', 'podman-docker', 'containerd', 'runc', 'docker-ce', 'docker-ce-cli']
-        require(not any(installed(package, env) for package in conflicts), 'CONFLICTING_PACKAGES_REQUIRE_REVIEW')
-        configure_official_repo(codename, env)
-        apt_install(['docker-ce', 'docker-ce-cli', 'containerd.io', 'docker-buildx-plugin', 'docker-compose-plugin'], env)
-    elif not compose:
-        configure_official_repo(codename, env)
-        apt_install(['docker-compose-plugin'], env)
-    active = execute(['systemctl', 'is-active', '--quiet', 'docker'], env, check=False).returncode == 0
-    enabled = execute(['systemctl', 'is-enabled', '--quiet', 'docker'], env, check=False).returncode == 0
-    if not active or not enabled:
-        execute(['systemctl', 'enable', '--now', 'docker'], env)
-    execute(['docker', 'info', '--format', '{{.OSType}}'], env)
-    execute(['docker', 'compose', 'version'], env)
-
-def metadata(url, token):
-    if not url:
-        release = json.loads(download(RELEASE_API, token, True))
-        matches = [a['url'] for a in release['assets'] if a['name'] == 'notarialease-release.json']
-        require(len(matches) == 1, 'METADATA_ASSET_NOT_UNIQUE')
-        url = matches[0]
-    document = json.loads(download(url, token))
-    require(document.get('schema') == 1 and bool(re.fullmatch(r'ghcr\.io/[a-z0-9._/-]+@sha256:[a-f0-9]{64}', document.get('app_image', ''))), 'METADATA_INVALID')
-    if not document.get('installer_url'):
-        release = json.loads(download(RELEASE_API, token, True))
-        matches = [a['url'] for a in release['assets'] if a['name'] == 'install.sh']
-        require(len(matches) == 1, 'INSTALLER_ASSET_NOT_UNIQUE')
-        document['installer_url'] = matches[0]
-    return url, document
-
-def verified_artifacts(document, token, directory):
-    for name, prefix in [('install.sh', 'installer'), ('compose.yaml', 'compose'), ('notarialease', 'operator')]:
-        expected = document.get(prefix + '_sha256', '')
-        require(bool(re.fullmatch('[a-f0-9]{64}', expected)), 'ARTIFACT_HASH_MISSING')
-        body = download(document[prefix + '_url'], token)
-        require(hashlib.sha256(body).hexdigest() == expected, 'ARTIFACT_HASH_INVALID')
-        target = directory / name
-        target.write_bytes(body); target.chmod(0o600)
-
-def private_registry_config(root):
-    suffix = hashlib.sha256(str(root).encode()).hexdigest()[:16]
-    directory = Path('/root/.config/notarialease-registry') / suffix
-    for p in [directory, *directory.parents]:
-        require(not p.is_symlink(), 'REGISTRY_PATH_SYMLINK')
-    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-    directory.chmod(0o700)
-    config = directory / 'config.json'
-    if config.exists():
-        require(not config.is_symlink() and config.stat().st_uid == 0 and config.stat().st_mode & 0o077 == 0, 'REGISTRY_CONFIG_NOT_PRIVATE')
-        current = json.loads(config.read_text())
-        require(not current.get('credsStore') and not current.get('credHelpers'), 'EXTERNAL_CREDENTIAL_HELPER_NOT_ALLOWED')
-    return directory
+def run_certified(paths, options):
+    _, body = http_get(BOOTSTRAP_URL, hosts=('raw.githubusercontent.com',))
+    require(hashlib.sha256(body).hexdigest() == BOOTSTRAP_SHA, 'CERTIFIED_BOOTSTRAP_HASH_MISMATCH')
+    with tempfile.TemporaryDirectory(prefix='notarialease-curl-') as temporary:
+        directory = Path(temporary); directory.chmod(0o700)
+        filename = directory / 'install.py'; filename.write_bytes(body); filename.chmod(0o600)
+        args = [sys.executable, '-I', str(filename), '--github-token-file', str(paths[0]),
+                '--registry-token-file', str(paths[1]), '--registry-user', options.registry_user,
+                '--root', options.root, '--project', options.project, '--bind', options.bind, '--port', options.port]
+        env = {k: v for k, v in os.environ.items() if k not in ('GH_TOKEN', 'NEXO_GHCR_TOKEN', 'PYTHONPATH', 'PYTHONHOME')}
+        require(subprocess.run(args, cwd=directory, env=env, check=False).returncode == 0, 'CERTIFIED_INSTALLER_FAILED')
 
 def main(argv=None):
-    global PHASE
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--metadata-url')
-    parser.add_argument('--root', default='/opt/notarialease')
-    parser.add_argument('--project', default='notarialease')
+    parser.add_argument('--credentials-dir', default=CONFIG)
+    parser.add_argument('--registry-user', default='duarteprg-eng')
     parser.add_argument('--bind', default='127.0.0.1')
     parser.add_argument('--port', default='3080')
-    parser.add_argument('--github-token-file')
-    parser.add_argument('--registry-user', '--github-user', dest='registry_user')
-    parser.add_argument('--registry-token-file')
-    args = parser.parse_args(argv)
+    parser.add_argument('--root', default='/opt/notarialease')
+    parser.add_argument('--project', default='notarialease')
+    parser.add_argument('--check-access', action='store_true')
+    options = parser.parse_args(argv)
+    require(platform.system() == 'Linux' and os.geteuid() == 0, 'LINUX_ROOT_REQUIRED')
     os.umask(0o077)
-    codename = ubuntu_codename()
-    original_root = Path(args.root)
-    require(original_root.is_absolute() and not any(p.is_symlink() for p in [original_root, *original_root.parents]), 'ROOT_PATH_INVALID')
-    root = Path(os.path.realpath(original_root))
-    require(str(root) != '/' and bool(re.fullmatch('[a-z0-9][a-z0-9_-]{0,47}', args.project)), 'INSTALL_ARGUMENT_INVALID')
-    require(bool(re.fullmatch('[1-9][0-9]{0,4}', args.port)) and int(args.port) <= 65535, 'HTTP_PORT_INVALID')
-    ipaddress.IPv4Address(args.bind)
-    if root.exists():
-        require(root.is_dir() and (root / 'receipt.json').is_file(), 'EXISTING_ROOT_REQUIRES_REVIEW')
-    github = read_token(args.github_token_file, 'GH_TOKEN', 'Token GitHub de leitura: ')
-    PHASE = 'release'
-    source, document = metadata(args.metadata_url, github)
-    with tempfile.TemporaryDirectory(prefix='notarialease-python-') as temporary:
-        directory = Path(temporary); directory.chmod(0o700)
-        verified_artifacts(document, github, directory)
-        env = {k: v for k, v in os.environ.items() if k not in ['GH_TOKEN', 'NEXO_GHCR_TOKEN', 'DOCKER_HOST', 'DOCKER_CONTEXT', 'DOCKER_CONFIG']}
-        env['DEBIAN_FRONTEND'] = 'noninteractive'
-        env['DOCKER_HOST'] = 'unix:///var/run/docker.sock'
-        PHASE = 'docker'
-        ensure_runtime_tools(env)
-        ensure_docker(codename, env)
-        PHASE = 'registry'
-        authorized = execute(['docker', 'pull', document['app_image']], env, check=False).returncode == 0
-        if authorized:
-            print('NEXO_PYTHON registry_access=already_authorized_digest')
-        else:
-            registry_user = args.registry_user or os.environ.get('GH_USERNAME') or os.environ.get('GITHUB_ACTOR')
-            if not registry_user:
-                try: registry_user = json.loads(download('https://api.github.com/user', github, True))['login']
-                except Exception: raise Failure('REGISTRY_USER_REQUIRED_USE_GITHUB_USER') from None
-            require(bool(re.fullmatch('[A-Za-z0-9_-]{1,64}', registry_user)), 'REGISTRY_USER_INVALID')
-            registry_token = (read_token(args.registry_token_file, 'NEXO_GHCR_TOKEN', 'Token GHCR de leitura: ')
-                              if args.registry_token_file or os.environ.get('NEXO_GHCR_TOKEN') else github)
-            registry = private_registry_config(root)
-            env['DOCKER_CONFIG'] = str(registry)
-            execute(['docker', '--config', str(registry), 'login', 'ghcr.io', '--username', registry_user, '--password-stdin'], env, data=registry_token + '\n')
-            registry_token = None
-            require((registry / 'config.json').is_file(), 'REGISTRY_CONFIG_NOT_CREATED')
-            (registry / 'config.json').chmod(0o600)
-            print('NEXO_PYTHON registry_credentials=persisted_root_0600 config=' + str(registry))
-        PHASE = 'application'
-        env['GH_TOKEN'] = github
-        result = subprocess.run(['bash', str(directory / 'install.sh'), '--metadata-url', source,
-                                 '--root', str(root), '--project', args.project, '--bind', args.bind,
-                                 '--port', args.port], env=env, check=False)
-        github = None; env.pop('GH_TOKEN', None)
-        require(result.returncode == 0, 'APPLICATION_INSTALL_FAILED')
-    print('NEXO_PYTHON status=READY automatic_updates=false')
+    require(re.fullmatch(r'[1-9][0-9]{0,4}', options.port) is not None and int(options.port) <= 65535, 'HTTP_PORT_INVALID')
+    require(re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,47}', options.project) is not None, 'PROJECT_INVALID')
+    require(re.fullmatch(r'[A-Za-z0-9_-]{1,64}', options.registry_user) is not None, 'REGISTRY_USER_INVALID')
+    require(Path(options.root).is_absolute() and options.root != '/', 'ROOT_INVALID')
+    try: ipaddress.IPv4Address(options.bind)
+    except ValueError: raise Failure('BIND_INVALID') from None
+    directory = Path(options.credentials_dir)
+    paths, values, new = credentials(directory)
+    check_access(values, options.registry_user)
+    if new: save_new_pair(directory, paths, values)
+    values = None
+    if options.check_access:
+        print('NEXO_CURL_ACCESS status=APPROVED code=READ_ONLY_ACCESS_OK')
+    else:
+        run_certified(paths, options)
+        print('NEXO_CURL_INSTALL status=READY code=CERTIFIED_INSTALLER_OK')
+
+def entrypoint(argv=None):
+    try:
+        main(argv); return 0
+    except Exception as error:
+        code = str(error) if isinstance(error, Failure) else 'BOOTSTRAP_FAILED'
+        print('NEXO_CURL_INSTALL status=FAILED code=' + code, file=sys.stderr)
+        return 1
 
 if __name__ == '__main__':
-    try:
-        main()
-    except Exception as error:
-        code = str(error) if isinstance(error, Failure) else type(error).__name__.upper()
-        print('NEXO_PYTHON status=FAILED phase=' + PHASE + ' code=' + code, file=sys.stderr)
-        sys.exit(1)
+    sys.exit(entrypoint())
