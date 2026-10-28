@@ -1,7 +1,5 @@
 # NotarialEase — instalação Ubuntu por curl
 
-> A revisão 1.0.28-test.1 foi retirada durante a validação na VM. Aguarde a revisão seguinte para usar as novas opções Admin. A instalação existente permanece preservada. Os tags anteriores não foram alterados.
-
 Este repositório publica somente a entrada e o mecanismo Python do instalador. Aplicação, imagens e releases permanecem privadas. Não há tokens, bancos ou dados de clientes neste repositório.
 
 ## Instalar ou atualizar
@@ -10,7 +8,7 @@ No Ubuntu Server amd64 com curl, Python 3 e sudo:
 
 ~~~bash
 set -o pipefail
-curl -fsSL https://raw.githubusercontent.com/duarteprg-eng/notarialease-installer/docker-bootstrap-v1.0.28-test.1/install.py | sudo python3 - --bind 127.0.0.1 --port 3080
+curl -fsSL https://raw.githubusercontent.com/duarteprg-eng/notarialease-installer/docker-bootstrap-v1.0.28-test.2/install.py | sudo python3 - --bind 127.0.0.1 --port 3080
 ~~~
 
 Troque o IPv4 pelo endereço autorizado da VPN. A porta padrão é 3080. Ao atualizar, use o mesmo --root e --project da instalação existente. O script baixa o mecanismo engine.py deste mesmo tag e verifica seu SHA-256 e os metadados da release privada. Os tags anteriores permanecem disponíveis.
@@ -23,7 +21,7 @@ Para conferir apenas acesso:
 
 ~~~bash
 set -o pipefail
-curl -fsSL https://raw.githubusercontent.com/duarteprg-eng/notarialease-installer/docker-bootstrap-v1.0.28-test.1/install.py | sudo python3 - --check-access
+curl -fsSL https://raw.githubusercontent.com/duarteprg-eng/notarialease-installer/docker-bootstrap-v1.0.28-test.2/install.py | sudo python3 - --check-access
 ~~~
 
 Esse modo não executa Docker, APT, setup ou banco. No modo de instalação, Docker/Compose ausentes são preparados pela fonte oficial. O instalador cria a aplicação e PostgreSQL 18.6 com os catálogos obrigatórios, sem atendimentos nem serventia. O administrador inicial precisa trocar a senha no primeiro acesso.
