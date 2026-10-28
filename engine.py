@@ -22,7 +22,7 @@ import warnings
 from urllib.parse import urlsplit
 from urllib.request import Request, HTTPRedirectHandler, build_opener
 
-RELEASE_API = 'https://api.github.com/repos/duarteprg-eng/notarialease/releases/tags/docker-v1.0.28-test.2'
+RELEASE_API = 'https://api.github.com/repos/duarteprg-eng/notarialease/releases/tags/docker-v1.0.29-test.1'
 DOCKER_KEY_URL = 'https://download.docker.com/linux/ubuntu/gpg'
 DOCKER_KEY_FINGERPRINT = '9DC858229FC7DD38854AE2D88D81803C0EBFCD88'
 PHASE = 'preflight'
