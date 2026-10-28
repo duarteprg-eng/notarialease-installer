@@ -18,12 +18,12 @@ import warnings
 from urllib.parse import urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
-BOOTSTRAP_URL = 'https://raw.githubusercontent.com/duarteprg-eng/notarialease-installer/docker-bootstrap-v1.0.28-test.2/engine.py'
-BOOTSTRAP_SHA = '01e3bfda13b007d6df81ad2d12ace4074b90ae7e6d1131d03d37fa0a88af391a'
-RELEASE_ID = 426150103
-TAG = 'docker-v1.0.28-test.2'
+BOOTSTRAP_URL = 'https://raw.githubusercontent.com/duarteprg-eng/notarialease-installer/docker-bootstrap-v1.0.29-test.1/engine.py'
+BOOTSTRAP_SHA = '9e5faff387c807e626c159cf6b7de8ae01671875817efc4f57b16bd841b52f77'
+RELEASE_ID = 426195406
+TAG = 'docker-v1.0.29-test.1'
 API = 'https://api.github.com/repos/duarteprg-eng/notarialease'
-IMAGE_DIGEST = 'sha256:2fd716fbc8ef1c2d1cdae20c774b96bf5e5e030d72ab072d270dae57177755b4'
+IMAGE_DIGEST = 'sha256:ff74d629f0c5e60211a65d2843566c5c43da6dba36ebc05890f6c49a79b2f099'
 IMAGE = 'ghcr.io/duarteprg-eng/notarialease@' + IMAGE_DIGEST
 CONFIG = '/root/.config/notarialease-install'
 NAMES = ('github-release.token', 'ghcr-read.token')
