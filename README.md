@@ -1,33 +1,35 @@
 # NotarialEase — instalação Ubuntu por curl
 
-Entrada pública do instalador Python. Aplicação, release e imagem GHCR permanecem privadas. Este repositório não contém credenciais, backups ou dados de clientes.
+Este repositório publica somente a entrada e o mecanismo Python do instalador. Aplicação, imagens e releases permanecem privadas. Não há tokens, bancos ou dados de clientes neste repositório.
 
-## Instalar
+## Instalar ou atualizar
 
-No Ubuntu Server amd64 com curl, Python3 e sudo, execute (troque o IPv4 pelo endereço autorizado do seu servidor):
+No Ubuntu Server amd64 com curl, Python 3 e sudo:
 
-```bash
+~~~bash
 set -o pipefail
-curl -fsSL https://raw.githubusercontent.com/duarteprg-eng/notarialease-installer/docker-bootstrap-v1.0.27-test.2/install.py | sudo python3 - --bind 127.0.0.1 --port 3080
-```
+curl -fsSL https://raw.githubusercontent.com/duarteprg-eng/notarialease-installer/docker-bootstrap-v1.0.28-test.1/install.py | sudo python3 - --bind 127.0.0.1 --port 3080
+~~~
 
-Não é necessário baixar, copiar ou extrair ZIP/TAR. O código funciona via stdin. Para disponibilizar na VPN, informe o IPv4 da VPN em --bind.
+Troque o IPv4 pelo endereço autorizado da VPN. A porta padrão é 3080. Ao atualizar, use o mesmo --root e --project da instalação existente. O script baixa o mecanismo engine.py deste mesmo tag e verifica seu SHA-256 e os metadados da release privada. Os tags anteriores permanecem disponíveis.
 
-O script reutiliza automaticamente github-release.token e ghcr-read.token em /root/.config/notarialease-install, pasta root0700 e arquivos root0600/0400. Se ausentes, solicita os dois acessos em prompts protegidos por /dev/tty e os guarda nesse diretório. Credenciais preexistentes conflitantes são preservadas. Nunca colocar tokens na URL ou nos argumentos do comando.
+Os dois acessos de leitura são mantidos no servidor em /root/.config/notarialease-install: github-release.token e ghcr-read.token, arquivos root0600/0400 em pasta root0700. Se ausentes, a entrada solicita os tokens em terminal protegido, valida o acesso e os salva. Nenhum token é incorporado ao script, à URL ou aos argumentos.
 
-São dois acessos somente leitura: fine-grained Contents/Metadata apenas do repositório notarialease; PAT classic somente read:packages para GHCR. O classic alcança os pacotes acessíveis à conta emissora, sem permitir upload/exclusão. A preparação de autenticação é local e individual por servidor; não há token global no script público.
+O primeiro token precisa de Contents/Metadata de leitura somente no repositório notarialease. O segundo precisa somente read:packages no GHCR. O token de pacotes pode alcançar os pacotes acessíveis à conta emissora; não permite upload ou exclusão. A preparação é individual por servidor.
 
-## Conferir acesso antes de instalar
+Para conferir apenas acesso:
 
-```bash
+~~~bash
 set -o pipefail
-curl -fsSL https://raw.githubusercontent.com/duarteprg-eng/notarialease-installer/docker-bootstrap-v1.0.27-test.2/install.py | sudo python3 - --check-access
-```
+curl -fsSL https://raw.githubusercontent.com/duarteprg-eng/notarialease-installer/docker-bootstrap-v1.0.28-test.1/install.py | sudo python3 - --check-access
+~~~
 
-Esse modo consulta a release privada e o manifesto da imagem por HTTPS, sem executar Docker, APT, setup ou banco.
+Esse modo não executa Docker, APT, setup ou banco. No modo de instalação, Docker/Compose ausentes são preparados pela fonte oficial. O instalador cria a aplicação e PostgreSQL 18.6 com os catálogos obrigatórios, sem atendimentos nem serventia. O administrador inicial precisa trocar a senha no primeiro acesso.
 
-## O que o modo de instalação faz
+## Manutenção pelo Admin
 
-Reutiliza o instalador testado da release docker-v1.0.27-test.1 após conferir SHA256 fixado. Prepara Docker/Compose por fonte oficial se necessário, ativa os serviços, cria PostgreSQL e aplicativo em containers e valida a aplicação. Bases iniciais têm apenas os cadastros obrigatórios, sem atendimentos ou serventias.
+A versão 1.0.28 oferece Atualização do Sistema e Migração de Dados no Admin. A atualização baixa uma release permitida do GitHub, valida imagem/backups/migrações e preserva credenciais e MFA existentes. Cada aplicação exige confirmação do administrador; atualização sem confirmação permanece desabilitada no canal de teste.
 
-O primeiro login exige troca da senha inicial definida pelo responsável. Projetos/volumes conflitantes são preservados e interrompem a instalação. Canal de teste: atualização automática permanece desativada.
+A migração recebe um arquivo NEXO migration v1 (.nexo.jsonl.gz) para cada um dos dois bancos, sempre do mesmo lote. Gera prévia, preserva as tabelas originais e prepara os dados em PostgreSQL isolado antes de solicitar confirmação. Arquivos reais devem permanecer privados; gzip não cifra dados. Campos antigos sem equivalente e históricos incompatíveis ficam preservados nas tabelas legadas e podem não aparecer na UI atual. Usuários históricos precisam de revisão para ativar acesso.
+
+Um controlador restrito do host executa as operações por socket Unix. O aplicativo não recebe Docker socket nem os tokens GitHub. Falha depois de iniciar migração em uso bloqueia novas alterações e exige revisão; não há restauração SQL automática. O volume original é preservado na promoção de dados.
