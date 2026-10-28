@@ -1,5 +1,7 @@
 # NotarialEase — instalação Ubuntu por curl
 
+> A revisão 1.0.28-test.1 foi retirada durante a validação na VM. Aguarde a revisão seguinte para usar as novas opções Admin. A instalação existente permanece preservada. Os tags anteriores não foram alterados.
+
 Este repositório publica somente a entrada e o mecanismo Python do instalador. Aplicação, imagens e releases permanecem privadas. Não há tokens, bancos ou dados de clientes neste repositório.
 
 ## Instalar ou atualizar
