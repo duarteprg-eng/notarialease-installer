@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Standalone private-access launcher; also supports curl | sudo python3 -."""
+"""Install the newest published private release; supports curl | sudo python3 -."""
 import argparse
 import base64
 import getpass
@@ -18,13 +18,8 @@ import warnings
 from urllib.parse import urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
-BOOTSTRAP_URL = 'https://raw.githubusercontent.com/duarteprg-eng/notarialease-installer/docker-bootstrap-v1.0.29-test.1/engine.py'
-BOOTSTRAP_SHA = '9e5faff387c807e626c159cf6b7de8ae01671875817efc4f57b16bd841b52f77'
-RELEASE_ID = 426195406
-TAG = 'docker-v1.0.29-test.1'
 API = 'https://api.github.com/repos/duarteprg-eng/notarialease'
-IMAGE_DIGEST = 'sha256:ff74d629f0c5e60211a65d2843566c5c43da6dba36ebc05890f6c49a79b2f099'
-IMAGE = 'ghcr.io/duarteprg-eng/notarialease@' + IMAGE_DIGEST
+IMAGE_PREFIX = 'ghcr.io/duarteprg-eng/notarialease@sha256:'
 CONFIG = '/root/.config/notarialease-install'
 NAMES = ('github-release.token', 'ghcr-read.token')
 TOKEN_PATTERN = r'[A-Za-z0-9._~+/-]+=*'
@@ -128,7 +123,7 @@ def http_get(url, headers=None, hosts=()):
     target = urlsplit(url)
     require(target.scheme == 'https' and target.hostname in hosts and target.port in (None, 443)
             and not target.username and not target.password, 'ACCESS_URL_REJECTED')
-    request = Request(url, headers={'User-Agent': 'NotarialEase-Curl-Installer', **(headers or {})})
+    request = Request(url, headers={'User-Agent': 'NotarialEase-Curl-Installer', 'Cache-Control': 'no-cache', **(headers or {})})
     try:
         with build_opener(ProxyHandler({}), SafeRedirect(hosts)).open(request, timeout=60) as response:
             require(response.status == 200, 'ACCESS_HTTP_STATUS_INVALID')
@@ -138,24 +133,64 @@ def http_get(url, headers=None, hosts=()):
     except Failure: raise
     except Exception: raise Failure('ACCESS_REQUEST_FAILED') from None
 
+def release_order(release):
+    match = re.fullmatch(r'docker-v(\d+)\.(\d+)\.(\d+)(?:-test\.(\d+))?', release.get('tag_name', ''))
+    if release.get('draft') or not match:
+        return None
+    return (*map(int, match.group(1, 2, 3)), int(match[4]) if match[4] else float('inf'))
+
+def newest_release(github):
+    auth = {'Authorization': 'Bearer ' + github, 'Accept': 'application/vnd.github+json'}
+    releases = []
+    for page in range(1, 101):
+        _, body = http_get(API + '/releases?per_page=100&page=' + str(page), auth, ('api.github.com',))
+        batch = json.loads(body); require(isinstance(batch, list), 'RELEASE_LIST_INVALID')
+        releases.extend(r for r in batch if release_order(r) is not None)
+        if len(batch) < 100: break
+    else: raise Failure('RELEASE_HISTORY_LIMIT')
+    require(bool(releases), 'PUBLISHED_RELEASE_REQUIRED')
+    # A broken newest release blocks; never silently install an older package.
+    return max(releases, key=release_order)
+
+def certified_bundle(github):
+    release = newest_release(github)
+    require(type(release.get('id')) is int and release['id'] > 0, 'CERTIFIED_RELEASE_MISMATCH')
+    def asset(name):
+        matches = [a for a in release.get('assets', []) if a.get('name') == name]
+        require(len(matches) == 1, 'CERTIFIED_ASSET_NOT_UNIQUE')
+        url = matches[0].get('url', '')
+        require(re.fullmatch(re.escape(API) + r'/releases/assets/[0-9]+', url) is not None,
+                'CERTIFIED_ASSET_URL_INVALID')
+        return url
+    def fetch(url):
+        return http_get(url, {'Authorization': 'Bearer ' + github, 'Accept': 'application/octet-stream'},
+                        ('api.github.com', 'release-assets.githubusercontent.com', 'objects.githubusercontent.com'))[1]
+    metadata_url = asset('notarialease-release.json')
+    body = fetch(metadata_url); metadata = json.loads(body)
+    expected_version = '.'.join(map(str, release_order(release)[:3]))
+    require(metadata.get('schema') == 1 and metadata.get('release_id') == release['tag_name']
+            and metadata.get('app_version') == expected_version
+            and metadata.get('github_release_id') == release['id']
+            and re.fullmatch(re.escape(IMAGE_PREFIX) + r'[a-f0-9]{64}', metadata.get('app_image', '')) is not None,
+            'CERTIFIED_IMAGE_METADATA_MISMATCH')
+    checks = {}
+    for line in fetch(asset('SHA256SUMS.txt')).decode('ascii').splitlines():
+        match = re.fullmatch(r'([a-f0-9]{64})  ([A-Za-z0-9._-]+)', line)
+        require(match is not None and match[2] not in checks, 'CERTIFIED_CHECKSUM_INVALID')
+        checks[match[2]] = match[1]
+    require(checks.get('notarialease-release.json') == hashlib.sha256(body).hexdigest(),
+            'CERTIFIED_METADATA_CHECKSUM_MISMATCH')
+    engine_sha = metadata.get('python_sha256', '')
+    require(re.fullmatch(r'[a-f0-9]{64}', engine_sha) is not None and checks.get('install.py') == engine_sha,
+            'CERTIFIED_BOOTSTRAP_HASH_MISMATCH')
+    engine = fetch(asset('install.py'))
+    require(hashlib.sha256(engine).hexdigest() == engine_sha, 'CERTIFIED_BOOTSTRAP_HASH_MISMATCH')
+    return {'metadata_url': metadata_url, 'engine': engine, 'image': metadata['app_image'], 'tag': release['tag_name']}
+
 def check_access(values, registry_user):
     github, registry = values
-    auth = {'Authorization': 'Bearer ' + github, 'Accept': 'application/vnd.github+json'}
-    _, body = http_get(API + '/releases/' + str(RELEASE_ID), auth, ('api.github.com',))
-    release = json.loads(body)
-    require(release.get('id') == RELEASE_ID and release.get('tag_name') == TAG
-            and release.get('draft') is False, 'CERTIFIED_RELEASE_MISMATCH')
-    assets = [a for a in release.get('assets', []) if a.get('name') == 'notarialease-release.json']
-    require(len(assets) == 1, 'CERTIFIED_METADATA_NOT_UNIQUE')
-    url = assets[0]['url']
-    require(re.fullmatch(re.escape(API) + r'/releases/assets/[0-9]+', url) is not None,
-            'CERTIFIED_METADATA_URL_INVALID')
-    _, body = http_get(url, {'Authorization': 'Bearer ' + github, 'Accept': 'application/octet-stream'},
-                       ('api.github.com', 'release-assets.githubusercontent.com', 'objects.githubusercontent.com'))
-    metadata = json.loads(body)
-    require(metadata.get('schema') == 1 and metadata.get('release_id') == TAG
-            and metadata.get('app_image') == IMAGE and metadata.get('python_sha256') == BOOTSTRAP_SHA,
-            'CERTIFIED_IMAGE_METADATA_MISMATCH')
+    bundle = certified_bundle(github)
+    image_digest = bundle['image'].split('@')[1]
     headers, body = http_get('https://api.github.com/user', {'Authorization': 'Bearer ' + registry}, ('api.github.com',))
     scopes = {s.strip() for s in headers.get('X-OAuth-Scopes', '').split(',') if s.strip()}
     require(scopes == {'read:packages'}, 'REGISTRY_SCOPE_NOT_READ_ONLY')
@@ -167,18 +202,18 @@ def check_access(values, registry_user):
     token_format(bearer)
     accept = ', '.join(('application/vnd.oci.image.index.v1+json', 'application/vnd.oci.image.manifest.v1+json',
                         'application/vnd.docker.distribution.manifest.v2+json', 'application/vnd.docker.distribution.manifest.list.v2+json'))
-    url = 'https://ghcr.io/v2/duarteprg-eng/notarialease/manifests/' + IMAGE_DIGEST
+    url = 'https://ghcr.io/v2/duarteprg-eng/notarialease/manifests/' + image_digest
     headers, body = http_get(url, {'Authorization': 'Bearer ' + bearer, 'Accept': accept}, ('ghcr.io',))
-    require(headers.get('Docker-Content-Digest') == IMAGE_DIGEST
-            and 'sha256:' + hashlib.sha256(body).hexdigest() == IMAGE_DIGEST, 'REGISTRY_MANIFEST_DIGEST_MISMATCH')
+    require(headers.get('Docker-Content-Digest') == image_digest
+            and 'sha256:' + hashlib.sha256(body).hexdigest() == image_digest, 'REGISTRY_MANIFEST_DIGEST_MISMATCH')
+    return bundle
 
-def run_certified(paths, options):
-    _, body = http_get(BOOTSTRAP_URL, hosts=('raw.githubusercontent.com',))
-    require(hashlib.sha256(body).hexdigest() == BOOTSTRAP_SHA, 'CERTIFIED_BOOTSTRAP_HASH_MISMATCH')
+def run_certified(paths, options, bundle):
+    body = bundle['engine']
     with tempfile.TemporaryDirectory(prefix='notarialease-curl-') as temporary:
         directory = Path(temporary); directory.chmod(0o700)
         filename = directory / 'install.py'; filename.write_bytes(body); filename.chmod(0o600)
-        args = [sys.executable, '-I', str(filename), '--github-token-file', str(paths[0]),
+        args = [sys.executable, '-I', str(filename), '--metadata-url', bundle['metadata_url'], '--github-token-file', str(paths[0]),
                 '--registry-token-file', str(paths[1]), '--registry-user', options.registry_user,
                 '--root', options.root, '--project', options.project, '--bind', options.bind, '--port', options.port]
         env = {k: v for k, v in os.environ.items() if k not in ('GH_TOKEN', 'NEXO_GHCR_TOKEN', 'PYTHONPATH', 'PYTHONHOME')}
@@ -204,13 +239,13 @@ def main(argv=None):
     except ValueError: raise Failure('BIND_INVALID') from None
     directory = Path(options.credentials_dir)
     paths, values, new = credentials(directory)
-    check_access(values, options.registry_user)
+    bundle = check_access(values, options.registry_user)
     if new: save_new_pair(directory, paths, values)
     values = None
     if options.check_access:
         print('NEXO_CURL_ACCESS status=APPROVED code=READ_ONLY_ACCESS_OK')
     else:
-        run_certified(paths, options)
+        run_certified(paths, options, bundle)
         print('NEXO_CURL_INSTALL status=READY code=CERTIFIED_INSTALLER_OK')
 
 def entrypoint(argv=None):
